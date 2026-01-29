@@ -31,16 +31,31 @@ class ToolConfig {
             throw new RuntimeException("Cannot resolve config file path: {$filePath}");
         }
         
-        $allowedPaths = [
-            '/etc/socket-stats/',
-            getenv('HOME') . '/.config/socket-stats/',
-            __DIR__ . '/config/'
-        ];
+        $allowedPaths = [];
+        
+        if (is_dir('/etc/socket-stats/')) {
+            $allowedPaths[] = realpath('/etc/socket-stats/');
+        }
+        
+        $home = getenv('HOME');
+        if ($home && is_dir($home . '/.config/socket-stats/')) {
+            $homeConfig = realpath($home . '/.config/socket-stats/');
+            if ($homeConfig !== false) {
+                $allowedPaths[] = $homeConfig;
+            }
+        }
+        
+        $localConfig = __DIR__ . '/config/';
+        if (is_dir($localConfig)) {
+            $localReal = realpath($localConfig);
+            if ($localReal !== false) {
+                $allowedPaths[] = $localReal;
+            }
+        }
         
         $isAllowed = false;
         foreach ($allowedPaths as $allowed) {
-            $allowedReal = realpath($allowed);
-            if ($allowedReal && strpos($realPath . '/', $allowedReal . '/') === 0) {
+            if ($allowed && strpos($realPath . '/', $allowed . '/') === 0) {
                 $isAllowed = true;
                 break;
             }
@@ -75,6 +90,7 @@ class SocketStatsTool {
     private array $logCacheTime = [];
     private bool $shutdownRequested = false;
     private ?array $protocolParsers = null;
+    private ?array $compiledPatterns = null;
     
     public function __construct() {
         $this->logLevels = [
@@ -90,14 +106,6 @@ class SocketStatsTool {
     }
     
     public function signalHandler(int $signo): void {
-        $signals = [
-            SIGINT => 'SIGINT',
-            SIGTERM => 'SIGTERM',
-            SIGHUP => 'SIGHUP'
-        ];
-        
-        $signalName = $signals[$signo] ?? "Signal $signo";
-        $this->logMessage('INFO', "Received $signalName, shutting down");
         $this->shutdownRequested = true;
     }
     
@@ -202,9 +210,27 @@ class SocketStatsTool {
     private function sanitizePath(string $path): string {
         $path = str_replace("\0", '', $path);
         $path = trim($path);
-        $path = str_replace(['../', '..\\'], '', $path);
+        
         $path = str_replace('\\', '/', $path);
+        
+        $counter = 0;
+        while ((strpos($path, '/../') !== false || strpos($path, '../') === 0) && $counter++ < 10) {
+            $path = preg_replace('/(^|\/)(?!\.\.)[^\/]+\/\.\.(\/|$)/', '', $path);
+            if ($path === null) {
+                $path = '';
+                break;
+            }
+        }
+        
         $path = preg_replace('/\/+/', '/', $path);
+        if ($path === null) {
+            return '';
+        }
+        
+        if (!str_starts_with($path, '/')) {
+            $path = ltrim($path, '/');
+        }
+        
         return $path;
     }
     
@@ -225,40 +251,24 @@ class SocketStatsTool {
         }
     }
     
-    private function validateFilePath(string $path): bool {
-        $realPath = realpath($path);
-        if ($realPath === false) {
-            return false;
-        }
-        
-        $allowedDirs = [
-            realpath('/proc/net') ?: '/proc/net',
-            realpath('/proc') ?: '/proc',
-            realpath('/tmp/socket-stats') ?: '/tmp/socket-stats'
-        ];
-        
-        foreach ($allowedDirs as $allowedDir) {
-            if ($allowedDir && strpos($realPath . '/', $allowedDir . '/') === 0) {
-                return is_file($realPath) && is_readable($realPath);
-            }
-        }
-        
-        return false;
-    }
-    
     private function safeFileOpen(string $path): SplFileObject {
         $realPath = realpath($path);
         if ($realPath === false) {
             throw new RuntimeException("Cannot resolve path: {$path}");
         }
         
-        if (!$this->validateFilePath($realPath)) {
+        if (!$this->isPathAllowed($realPath)) {
             throw new RuntimeException("Path not allowed: {$path}");
         }
         
+        clearstatcache(true, $realPath);
         $size = @filesize($realPath);
         if ($size === false || $size > self::MAX_FILE_SIZE) {
             throw new RuntimeException("File size exceeds limit: {$path}");
+        }
+        
+        if (!is_file($realPath) || !is_readable($realPath)) {
+            throw new RuntimeException("Cannot access file {$path}");
         }
         
         try {
@@ -270,6 +280,22 @@ class SocketStatsTool {
         }
     }
     
+    private function isPathAllowed(string $realPath): bool {
+        $allowedDirs = [
+            realpath('/proc/net') ?: '/proc/net',
+            realpath('/proc') ?: '/proc',
+            realpath('/tmp/socket-stats') ?: '/tmp/socket-stats'
+        ];
+        
+        foreach ($allowedDirs as $allowedDir) {
+            if ($allowedDir && strpos($realPath . '/', $allowedDir . '/') === 0) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
     private function logMessage(string $level, string $message): void {
         if ($this->shutdownRequested) {
             return;
@@ -278,6 +304,10 @@ class SocketStatsTool {
         if ($level === 'DEBUG') {
             $cacheKey = md5($message);
             $now = time();
+            
+            if (count($this->logCache) > 1000) {
+                $this->cleanLogCache();
+            }
             
             if (isset($this->logCache[$cacheKey]) && 
                 ($now - $this->logCacheTime[$cacheKey]) < 5) {
@@ -299,6 +329,15 @@ class SocketStatsTool {
         $formattedMessage = "[{$timestamp}] {$level}: {$message}";
         
         file_put_contents('php://stderr', $formattedMessage . PHP_EOL);
+    }
+    
+    private function cleanLogCache(): void {
+        $now = time();
+        foreach ($this->logCacheTime as $key => $timestamp) {
+            if ($now - $timestamp > 300) {
+                unset($this->logCache[$key], $this->logCacheTime[$key]);
+            }
+        }
     }
 
     private function showVersion(): void {
@@ -462,14 +501,26 @@ class SocketStatsTool {
         return $this->protocolParsers;
     }
 
+    private function getCompiledPatterns(): array {
+        if ($this->compiledPatterns === null) {
+            $this->compiledPatterns = [
+                'whitespace' => '/\s+/',
+                'path_cleanup' => '/(^|\/)(?!\.\.)[^\/]+\/\.\.(\/|$)/',
+                'multiple_slashes' => '/\/+/'
+            ];
+        }
+        return $this->compiledPatterns;
+    }
+
     private function parseLine(string $line, array &$stats): void {
         if (strlen($line) > self::MAX_LINE_SIZE) {
             $this->logMessage('WARNING', "Line too long, skipping");
             return;
         }
         
-        $parts = preg_split('/\s+/', trim($line));
-        if (count($parts) < 2) {
+        $patterns = $this->getCompiledPatterns();
+        $parts = preg_split($patterns['whitespace'], trim($line));
+        if ($parts === false || count($parts) < 2) {
             $this->logMessage('DEBUG', "Skipping malformed line: {$line}");
             return;
         }
@@ -581,8 +632,11 @@ class SocketStatsTool {
             
             $line = trim($line);
             if (strpos($line, $section) === 0) {
-                $parts = preg_split('/\s+/', $line);
-                $this->parseProtocolSection($parts, $stats, $protocol, $mapping);
+                $patterns = $this->getCompiledPatterns();
+                $parts = preg_split($patterns['whitespace'], $line);
+                if ($parts !== false) {
+                    $this->parseProtocolSection($parts, $stats, $protocol, $mapping);
+                }
                 break;
             }
         }
@@ -590,6 +644,7 @@ class SocketStatsTool {
 
     private function loadSnmpInfo(SplFileObject $file, string $targetLine, int &$count): void {
         $inTargetLine = false;
+        $patterns = $this->getCompiledPatterns();
         
         foreach ($file as $line) {
             if ($this->shutdownRequested) {
@@ -604,8 +659,8 @@ class SocketStatsTool {
             }
             
             if ($inTargetLine) {
-                $parts = preg_split('/\s+/', $line);
-                if (count($parts) > 0) {
+                $parts = preg_split($patterns['whitespace'], $line);
+                if ($parts !== false && count($parts) > 0) {
                     $count = $this->parseInt($parts[0]);
                 }
                 break;
@@ -618,8 +673,9 @@ class SocketStatsTool {
             return;
         }
         
-        $parts = preg_split('/\s+/', trim($line));
-        if (count($parts) < 2) {
+        $patterns = $this->getCompiledPatterns();
+        $parts = preg_split($patterns['whitespace'], trim($line));
+        if ($parts === false || count($parts) < 2) {
             return;
         }
         
@@ -657,7 +713,9 @@ class SocketStatsTool {
     private function parseInt(string $value): int {
         $val = filter_var($value, FILTER_VALIDATE_INT);
         if ($val === false) {
-            throw new RuntimeException("Failed to parse integer: '{$value}'");
+            $backtrace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2);
+            $caller = $backtrace[1]['function'] ?? 'unknown';
+            throw new RuntimeException("Failed to parse integer '{$value}' in {$caller}");
         }
         return $val;
     }
