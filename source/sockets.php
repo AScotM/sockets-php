@@ -21,6 +21,12 @@ class ToolConfig {
         }
     }
     
+    public function __set(string $name, mixed $value): void {
+        if (property_exists($this, $name)) {
+            $this->$name = $value;
+        }
+    }
+    
     public function loadFromFile(string $filePath): void {
         if (!file_exists($filePath)) {
             throw new RuntimeException("Config file not found: {$filePath}");
@@ -72,6 +78,8 @@ class ToolConfig {
         
         foreach ($config as $key => $value) {
             if (property_exists($this, $key)) {
+                $expectedType = gettype($this->$key);
+                settype($value, $expectedType);
                 $this->$key = $value;
             }
         }
@@ -81,6 +89,8 @@ class ToolConfig {
 class SocketStatsTool {
     private const MAX_FILE_SIZE = 10485760;
     private const MAX_LINE_SIZE = 1048576;
+    private const MAX_LOG_CACHE_SIZE = 1000;
+    private const LOG_CACHE_TTL = 300;
     
     private ToolConfig $config;
     private array $logLevels;
@@ -210,25 +220,28 @@ class SocketStatsTool {
     private function sanitizePath(string $path): string {
         $path = str_replace("\0", '', $path);
         $path = trim($path);
-        
         $path = str_replace('\\', '/', $path);
         
-        $counter = 0;
-        while ((strpos($path, '/../') !== false || strpos($path, '../') === 0) && $counter++ < 10) {
-            $path = preg_replace('/(^|\/)(?!\.\.)[^\/]+\/\.\.(\/|$)/', '', $path);
-            if ($path === null) {
-                $path = '';
-                break;
+        $parts = explode('/', $path);
+        $result = [];
+        
+        foreach ($parts as $part) {
+            if ($part === '' || $part === '.') {
+                continue;
+            }
+            if ($part === '..') {
+                if (count($result) > 0) {
+                    array_pop($result);
+                }
+            } else {
+                $result[] = $part;
             }
         }
         
-        $path = preg_replace('/\/+/', '/', $path);
-        if ($path === null) {
-            return '';
-        }
+        $path = (str_starts_with($path, '/') ? '/' : '') . implode('/', $result);
         
-        if (!str_starts_with($path, '/')) {
-            $path = ltrim($path, '/');
+        if (strpos($path, '..') !== false) {
+            return '';
         }
         
         return $path;
@@ -252,27 +265,36 @@ class SocketStatsTool {
     }
     
     private function safeFileOpen(string $path): SplFileObject {
-        $realPath = realpath($path);
-        if ($realPath === false) {
+        $resolvedPath = realpath($path);
+        if ($resolvedPath === false) {
             throw new RuntimeException("Cannot resolve path: {$path}");
         }
         
-        if (!$this->isPathAllowed($realPath)) {
+        if (!$this->isPathAllowed($resolvedPath)) {
             throw new RuntimeException("Path not allowed: {$path}");
         }
         
-        clearstatcache(true, $realPath);
-        $size = @filesize($realPath);
+        clearstatcache(true, $resolvedPath);
+        
+        $link = is_link($path);
+        if ($link) {
+            $linkTarget = readlink($path);
+            if ($linkTarget !== false && !$this->isPathAllowed(realpath($linkTarget) ?: $linkTarget)) {
+                throw new RuntimeException("Symbolic link target not allowed: {$path}");
+            }
+        }
+        
+        $size = @filesize($resolvedPath);
         if ($size === false || $size > self::MAX_FILE_SIZE) {
             throw new RuntimeException("File size exceeds limit: {$path}");
         }
         
-        if (!is_file($realPath) || !is_readable($realPath)) {
+        if (!is_file($resolvedPath) || !is_readable($resolvedPath)) {
             throw new RuntimeException("Cannot access file {$path}");
         }
         
         try {
-            $file = new SplFileObject($realPath, 'r');
+            $file = new SplFileObject($resolvedPath, 'r');
             $file->setFlags(SplFileObject::READ_AHEAD | SplFileObject::SKIP_EMPTY);
             return $file;
         } catch (RuntimeException $e) {
@@ -305,12 +327,12 @@ class SocketStatsTool {
             $cacheKey = md5($message);
             $now = time();
             
-            if (count($this->logCache) > 1000) {
+            if (count($this->logCache) > self::MAX_LOG_CACHE_SIZE) {
                 $this->cleanLogCache();
             }
             
             if (isset($this->logCache[$cacheKey]) && 
-                ($now - $this->logCacheTime[$cacheKey]) < 5) {
+                ($now - $this->logCacheTime[$cacheKey]) < self::LOG_CACHE_TTL) {
                 return;
             }
             
@@ -333,9 +355,20 @@ class SocketStatsTool {
     
     private function cleanLogCache(): void {
         $now = time();
+        
         foreach ($this->logCacheTime as $key => $timestamp) {
-            if ($now - $timestamp > 300) {
+            if ($now - $timestamp > self::LOG_CACHE_TTL) {
                 unset($this->logCache[$key], $this->logCacheTime[$key]);
+            }
+        }
+        
+        if (count($this->logCache) > self::MAX_LOG_CACHE_SIZE) {
+            $excess = count($this->logCache) - self::MAX_LOG_CACHE_SIZE;
+            $keys = array_keys($this->logCacheTime);
+            array_multisort($this->logCacheTime, SORT_ASC, $keys);
+            
+            for ($i = 0; $i < $excess; $i++) {
+                unset($this->logCache[$keys[$i]], $this->logCacheTime[$keys[$i]]);
             }
         }
     }
@@ -694,6 +727,10 @@ class SocketStatsTool {
     }
     
     private function parseProtocolSection(array $parts, array &$stats, string $protocol, array $mapping): void {
+        if (!isset($stats[$protocol])) {
+            $stats[$protocol] = [];
+        }
+        
         for ($i = 1; $i < count($parts); $i += 2) {
             if ($i + 1 >= count($parts)) {
                 break;
@@ -785,11 +822,15 @@ class SocketStatsTool {
         $this->outputProtocol('FRAG', $stats['frag'], $useColor, $sectionColor, $fieldColor, $colorEnd);
 
         if ($this->extendedMode) {
-            $this->outputExtended($stats, $useColor, $colorStart, $sectionColor, $fieldColor, $colorEnd);
+            $this->outputExtended($stats, $useColor, $titleColor, $sectionColor, $fieldColor, $colorEnd);
         }
     }
     
     private function outputProtocol(string $name, array $data, bool $useColor, string $sectionColor, string $fieldColor, string $colorEnd): void {
+        if (empty($data)) {
+            return;
+        }
+        
         echo "{$sectionColor}{$name}:{$colorEnd}" . PHP_EOL;
         foreach ($data as $field => $value) {
             $fieldName = str_replace('_', ' ', $field);
@@ -815,7 +856,7 @@ class SocketStatsTool {
         ];
         
         foreach ($extendedProtocols as $key => $protocolName) {
-            if (isset($stats[$key]) && $stats[$key]['in_use'] > 0) {
+            if (isset($stats[$key]) && !empty($stats[$key]) && $stats[$key]['in_use'] > 0) {
                 $this->outputProtocol($protocolName, $stats[$key], $useColor, $sectionColor, $fieldColor, $colorEnd);
             }
         }
