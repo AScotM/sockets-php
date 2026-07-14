@@ -266,9 +266,7 @@ final class SocketStatsReport implements JsonSerializable
 {
     public Metadata $metadata;
     public int $socketsUsed = 0;
-    /** @var array<string, ProtocolStats> */
     private array $protocols = [];
-    /** @var array<string, int> */
     private array $tcpExt = [];
 
     public function __construct(Metadata $metadata)
@@ -353,17 +351,17 @@ final class SocketStatsTool
     private const MAX_LINE_SIZE = 1048576;
     private const MAX_LOG_CACHE_SIZE = 1000;
     private const LOG_CACHE_TTL = 300;
+    private const MAX_PROTOCOL_LINE_LENGTH = 1000;
+    private const MIN_VALID_LINE_PARTS = 2;
+    private const MAX_CONFIG_VALUE_LENGTH = 255;
+    private const MAX_MEMORY_CACHE_BYTES = 1048576;
 
     private ToolConfig $config;
-    /** @var array<string, int> */
     private array $logLevels;
     private float $startTime;
     private bool $shutdownRequested = false;
-    /** @var array<string, string> */
     private array $logCache = [];
-    /** @var array<string, int> */
     private array $logCacheTime = [];
-    /** @var array<string, callable>|null */
     private ?array $protocolParsers = null;
 
     public function __construct()
@@ -453,6 +451,28 @@ final class SocketStatsTool
             exit(0);
         }
 
+        if (isset($options['log-level'])) {
+            $level = (string) $options['log-level'];
+            if (strlen($level) > 50) {
+                throw new RuntimeException('Log level value too long');
+            }
+            $this->validateLogLevel($level);
+        }
+
+        if (isset($options['path'])) {
+            $path = (string) $options['path'];
+            if (strlen($path) > 4096) {
+                throw new RuntimeException('Path value too long');
+            }
+        }
+
+        if (isset($options['config'])) {
+            $config = (string) $options['config'];
+            if (strlen($config) > 4096) {
+                throw new RuntimeException('Config path value too long');
+            }
+        }
+
         $configUpdates = [];
 
         if (isset($options['json'])) {
@@ -490,6 +510,16 @@ final class SocketStatsTool
         $this->config = new ToolConfig($configUpdates);
     }
 
+    private function validateLogLevel(string $level): void
+    {
+        $upper = strtoupper($level);
+        if (!isset($this->logLevels[$upper])) {
+            throw new RuntimeException(
+                "Invalid log level: {$level}. Valid levels: " . implode(', ', array_keys($this->logLevels))
+            );
+        }
+    }
+
     private function normalizePath(string $path): string
     {
         $path = str_replace("\0", '', trim($path));
@@ -522,8 +552,13 @@ final class SocketStatsTool
             throw new RuntimeException("Invalid path: contains null byte");
         }
 
-        if (!preg_match('/^[a-zA-Z0-9\/\.\-_]+$/', $this->config->sockstatPath)) {
-            throw new RuntimeException("Invalid path format: contains invalid characters");
+        $realPath = realpath($this->config->sockstatPath);
+        if ($realPath === false) {
+            throw new RuntimeException("Invalid path: {$this->config->sockstatPath}");
+        }
+
+        if (!$this->isPathAllowed($realPath)) {
+            throw new RuntimeException("Path not allowed: {$this->config->sockstatPath}");
         }
     }
 
@@ -550,11 +585,6 @@ final class SocketStatsTool
             }
         }
 
-        $size = @filesize($resolvedPath);
-        if ($size === false || $size > self::MAX_FILE_SIZE) {
-            throw new RuntimeException("File size exceeds limit: {$path}");
-        }
-
         if (!is_file($resolvedPath) || !is_readable($resolvedPath)) {
             throw new RuntimeException("Cannot access file {$path}");
         }
@@ -562,6 +592,12 @@ final class SocketStatsTool
         try {
             $file = new SplFileObject($resolvedPath, 'r');
             $file->setFlags(SplFileObject::READ_AHEAD | SplFileObject::SKIP_EMPTY);
+
+            $fileSize = $file->getSize();
+            if ($fileSize === false || $fileSize > self::MAX_FILE_SIZE) {
+                throw new RuntimeException("File size exceeds limit: {$path}");
+            }
+
             return $file;
         } catch (RuntimeException $e) {
             throw new RuntimeException("Cannot access file {$path}: " . $e->getMessage());
@@ -592,7 +628,7 @@ final class SocketStatsTool
         }
 
         if ($level === 'DEBUG') {
-            $cacheKey = md5($message);
+            $cacheKey = crc32($message) . '_' . substr(md5($message), 0, 8);
             $now = time();
 
             if (count($this->logCache) > self::MAX_LOG_CACHE_SIZE) {
@@ -631,6 +667,22 @@ final class SocketStatsTool
         }
 
         if (count($this->logCache) <= self::MAX_LOG_CACHE_SIZE) {
+            return;
+        }
+
+        $currentMemory = 0;
+        foreach ($this->logCache as $message) {
+            $currentMemory += strlen($message);
+        }
+
+        if ($currentMemory > self::MAX_MEMORY_CACHE_BYTES) {
+            arsort($this->logCacheTime);
+            while ($currentMemory > self::MAX_MEMORY_CACHE_BYTES && !empty($this->logCache)) {
+                $oldestKey = key($this->logCacheTime);
+                $currentMemory -= strlen($this->logCache[$oldestKey]);
+                unset($this->logCache[$oldestKey], $this->logCacheTime[$oldestKey]);
+                next($this->logCacheTime);
+            }
             return;
         }
 
@@ -743,10 +795,15 @@ final class SocketStatsTool
                 continue;
             }
 
+            if (strlen($line) > self::MAX_LINE_SIZE) {
+                $this->logMessage('WARNING', "Line too long, skipping");
+                continue;
+            }
+
             $this->parseLine($line, $report);
             $lineCount++;
 
-            if ($lineCount > 1000) {
+            if ($lineCount > self::MAX_PROTOCOL_LINE_LENGTH) {
                 throw new RuntimeException("File appears too large or malformed");
             }
         }
@@ -823,13 +880,8 @@ final class SocketStatsTool
 
     private function parseLine(string $line, SocketStatsReport $report): void
     {
-        if (strlen($line) > self::MAX_LINE_SIZE) {
-            $this->logMessage('WARNING', "Line too long, skipping");
-            return;
-        }
-
         $parts = preg_split('/\s+/', trim($line));
-        if ($parts === false || count($parts) < 2) {
+        if ($parts === false || count($parts) < self::MIN_VALID_LINE_PARTS) {
             $this->logMessage('DEBUG', "Skipping malformed line: {$line}");
             return;
         }
@@ -927,23 +979,10 @@ final class SocketStatsTool
 
     private function countFileLines(SplFileObject $file): int
     {
-        $lineCount = 0;
-        $firstLine = true;
-
-        foreach ($file as $line) {
-            if ($this->shutdownRequested) {
-                break;
-            }
-
-            if ($firstLine) {
-                $firstLine = false;
-                continue;
-            }
-
-            $lineCount++;
-        }
-
-        return $lineCount;
+        $file->seek(PHP_INT_MAX);
+        $lineCount = $file->key();
+        $file->rewind();
+        return max(0, $lineCount - 1);
     }
 
     private function loadProtocolFile(SplFileObject $file, string $section, SocketStatsReport $report, string $protocol, array $mapping): void
@@ -1045,9 +1084,9 @@ final class SocketStatsTool
     {
         $parsed = filter_var($value, FILTER_VALIDATE_INT);
         if ($parsed === false) {
-            throw new RuntimeException("Failed to parse integer '{$value}'");
+            $this->logMessage('WARNING', "Failed to parse integer '{$value}', using 0");
+            return 0;
         }
-
         return $parsed;
     }
 
