@@ -1,1273 +1,553 @@
 #!/usr/bin/env php
 <?php
-
 declare(strict_types=1);
 
-final class ToolConfig
-{
-    public string $logLevel;
-    public bool $jsonOutput;
-    public bool $help;
-    public bool $showPerformance;
-    public bool $quiet;
-    public bool $extended;
-    public string $sockstatPath;
-    public ?string $configFile;
+const VERSION = '2.0.0';
+const TCP_STATES = ['01'=>'ESTABLISHED','02'=>'SYN_SENT','03'=>'SYN_RECV','04'=>'FIN_WAIT1','05'=>'FIN_WAIT2','06'=>'TIME_WAIT','07'=>'CLOSE','08'=>'CLOSE_WAIT','09'=>'LAST_ACK','0A'=>'LISTEN','0B'=>'CLOSING','0C'=>'NEW_SYN_RECV'];
+const TABLES = ['tcp'=>['TCP',4],'tcp6'=>['TCP',6],'udp'=>['UDP',4],'udp6'=>['UDP',6],'udplite'=>['UDPLITE',4],'udplite6'=>['UDPLITE',6],'raw'=>['RAW',4],'raw6'=>['RAW',6]];
+const IMPORTANT = ['Tcp'=>['ActiveOpens','PassiveOpens','AttemptFails','EstabResets','InSegs','OutSegs','RetransSegs','InErrs','OutRsts'],'Udp'=>['InDatagrams','NoPorts','InErrors','OutDatagrams','RcvbufErrors','SndbufErrors'],'Ip'=>['InReceives','InDiscards','InDelivers','OutRequests','OutDiscards'],'TcpExt'=>['ListenOverflows','ListenDrops','TCPTimeouts','TCPSynRetrans','TCPLossProbes','TCPBacklogDrop','TCPMemoryPressures']];
 
-    public function __construct(array $options = [])
-    {
-        $this->logLevel = 'INFO';
-        $this->jsonOutput = false;
-        $this->help = false;
-        $this->showPerformance = false;
-        $this->quiet = false;
-        $this->extended = false;
-        $this->sockstatPath = '/proc/net/sockstat';
-        $this->configFile = null;
+final class Options {
+    public string $root = '/proc';
+    public string $format = 'human';
+    public ?string $output = null;
+    public bool $extended = false;
+    public bool $processes = false;
+    public int $processLimit = 20;
+    public bool $watch = false;
+    public float $interval = 2.0;
+    public int $count = 0;
+    public bool $performance = false;
+    public bool $quiet = false;
+    public bool $verbose = false;
+    public int $maxBytes = 33554432;
+    public array $thresholds = [];
 
-        $this->apply($options);
+    public static function parse(array $argv): self {
+        $o = new self();
+        $args = array_slice($argv, 1);
+        $values = ['interval','count','proc-root','path','output','process-limit','max-file-bytes','threshold-tcp','threshold-established','threshold-timewait','threshold-orphan','threshold-retrans','config','log-level'];
+        $flags = ['json','csv','extended','processes','watch','performance','quiet','verbose','help','version'];
+        $raw = [];
+        for ($i = 0; $i < count($args); $i++) {
+            $arg = $args[$i];
+            if (!str_starts_with($arg, '--')) {
+                throw new RuntimeException("Unknown argument: $arg");
+            }
+            $pair = explode('=', substr($arg, 2), 2);
+            $key = $pair[0];
+            if (in_array($key, $flags, true)) {
+                if (count($pair) !== 1) throw new RuntimeException("Unexpected value for --$key");
+                $raw[$key] = true;
+            } elseif (in_array($key, $values, true)) {
+                $value = $pair[1] ?? $args[++$i] ?? null;
+                if ($value === null || str_starts_with($value, '--')) throw new RuntimeException("Missing value for --$key");
+                $raw[$key] = $value;
+            } else {
+                throw new RuntimeException("Unknown option --$key");
+            }
+        }
+        if (isset($raw['help'])) {
+            echo self::help();
+            exit(0);
+        }
+        if (isset($raw['version'])) {
+            echo 'Socket Statistics Tool '.VERSION.' | PHP '.PHP_VERSION.PHP_EOL;
+            exit(0);
+        }
+        if (isset($raw['config'])) {
+            $file = $raw['config'];
+            if (!is_file($file) || !is_readable($file)) throw new RuntimeException("Cannot read config: $file");
+            $ini = parse_ini_file($file, false, INI_SCANNER_TYPED);
+            if (!is_array($ini)) throw new RuntimeException('Invalid INI configuration');
+            foreach ($ini as $key => $value) {
+                $key = str_replace('_', '-', (string)$key);
+                if (!in_array($key, array_merge($flags, $values), true) || in_array($key, ['config','help','version'], true)) throw new RuntimeException("Unknown configuration key: $key");
+                if (!array_key_exists($key, $raw)) $raw[$key] = $value;
+            }
+        }
+        if (isset($raw['json'], $raw['csv'])) throw new RuntimeException('--json and --csv are mutually exclusive');
+        $o->format = isset($raw['json']) && self::bool($raw['json']) ? 'json' : (isset($raw['csv']) && self::bool($raw['csv']) ? 'csv' : 'human');
+        foreach (['extended','processes','watch','performance','quiet','verbose'] as $key) {
+            if (array_key_exists($key, $raw)) $o->$key = self::bool($raw[$key]);
+        }
+        $o->root = (string)($raw['proc-root'] ?? '/proc');
+        if (isset($raw['path'])) {
+            $path = realpath((string)$raw['path']);
+            if ($path === false || basename($path) !== 'sockstat' || basename(dirname($path)) !== 'net') throw new RuntimeException('--path must reference an existing net/sockstat');
+            $o->root = dirname(dirname($path));
+        }
+        $root = realpath($o->root);
+        if ($root === false || !is_dir($root)) throw new RuntimeException('Invalid proc root');
+        $o->root = $root;
+        $o->output = isset($raw['output']) ? (string)$raw['output'] : null;
+        $o->interval = self::number($raw['interval'] ?? 2, 'interval', 0.001);
+        $o->count = self::integer($raw['count'] ?? 0, 'count', 0);
+        $o->processLimit = self::integer($raw['process-limit'] ?? 20, 'process-limit', 0);
+        $o->maxBytes = self::integer($raw['max-file-bytes'] ?? 33554432, 'max-file-bytes', 1);
+        foreach (['tcp','established','timewait','orphan'] as $key) {
+            if (isset($raw['threshold-'.$key])) $o->thresholds[$key] = self::integer($raw['threshold-'.$key], 'threshold-'.$key, 0);
+        }
+        if (isset($raw['threshold-retrans'])) $o->thresholds['retrans'] = self::number($raw['threshold-retrans'], 'threshold-retrans', 0, 100);
+        if (isset($raw['log-level']) && !in_array(strtoupper((string)$raw['log-level']), ['DEBUG','INFO','WARNING','ERROR'], true)) throw new RuntimeException('Invalid log level');
+        return $o;
     }
 
-    public function apply(array $options): void
-    {
-        foreach ($options as $key => $value) {
-            switch ($key) {
-                case 'log_level':
-                case 'logLevel':
-                    $this->logLevel = strtoupper((string) $value);
-                    break;
-                case 'json_output':
-                case 'jsonOutput':
-                    $this->jsonOutput = (bool) $value;
-                    break;
-                case 'help':
-                    $this->help = (bool) $value;
-                    break;
-                case 'show_performance':
-                case 'showPerformance':
-                    $this->showPerformance = (bool) $value;
-                    break;
-                case 'quiet':
-                    $this->quiet = (bool) $value;
-                    break;
-                case 'extended':
-                    $this->extended = (bool) $value;
-                    break;
-                case 'sockstat_path':
-                case 'sockstatPath':
-                    $this->sockstatPath = (string) $value;
-                    break;
-                case 'config_file':
-                case 'configFile':
-                    $this->configFile = $value === null ? null : (string) $value;
-                    break;
-            }
-        }
+    private static function bool(mixed $v): bool {
+        if (is_bool($v)) return $v;
+        $r = filter_var($v, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+        if ($r === null) throw new RuntimeException('Invalid boolean option');
+        return $r;
     }
-
-    public function loadFromFile(string $filePath): void
-    {
-        if (!file_exists($filePath)) {
-            throw new RuntimeException("Config file not found: {$filePath}");
-        }
-
-        $realPath = realpath($filePath);
-        if ($realPath === false) {
-            throw new RuntimeException("Cannot resolve config file path: {$filePath}");
-        }
-
-        if (!$this->isConfigPathAllowed($realPath)) {
-            throw new RuntimeException("Config file path not allowed: {$filePath}");
-        }
-
-        $config = parse_ini_file($realPath, false, INI_SCANNER_TYPED);
-        if ($config === false) {
-            throw new RuntimeException("Invalid config file format");
-        }
-
-        if (!is_array($config)) {
-            throw new RuntimeException("Invalid config file structure");
-        }
-
-        $mapped = [];
-
-        foreach ($config as $key => $value) {
-            switch ($key) {
-                case 'log_level':
-                    $mapped['logLevel'] = strtoupper((string) $value);
-                    break;
-                case 'json_output':
-                    $mapped['jsonOutput'] = (bool) $value;
-                    break;
-                case 'help':
-                    $mapped['help'] = (bool) $value;
-                    break;
-                case 'show_performance':
-                    $mapped['showPerformance'] = (bool) $value;
-                    break;
-                case 'quiet':
-                    $mapped['quiet'] = (bool) $value;
-                    break;
-                case 'extended':
-                    $mapped['extended'] = (bool) $value;
-                    break;
-                case 'sockstat_path':
-                    $mapped['sockstatPath'] = (string) $value;
-                    break;
-                case 'config_file':
-                    $mapped['configFile'] = $value === null ? null : (string) $value;
-                    break;
-            }
-        }
-
-        $this->apply($mapped);
+    private static function integer(mixed $v, string $name, int $min): int {
+        $n = filter_var($v, FILTER_VALIDATE_INT);
+        if ($n === false || $n < $min) throw new RuntimeException("Invalid --$name");
+        return $n;
     }
-
-    private function isConfigPathAllowed(string $realPath): bool
-    {
-        $allowedPaths = [];
-
-        if (is_dir('/etc/socket-stats/')) {
-            $resolved = realpath('/etc/socket-stats/');
-            if ($resolved !== false) {
-                $allowedPaths[] = $resolved;
-            }
-        }
-
-        $home = getenv('HOME');
-        if ($home && is_dir($home . '/.config/socket-stats/')) {
-            $resolved = realpath($home . '/.config/socket-stats/');
-            if ($resolved !== false) {
-                $allowedPaths[] = $resolved;
-            }
-        }
-
-        $localConfig = __DIR__ . '/config/';
-        if (is_dir($localConfig)) {
-            $resolved = realpath($localConfig);
-            if ($resolved !== false) {
-                $allowedPaths[] = $resolved;
-            }
-        }
-
-        foreach ($allowedPaths as $allowed) {
-            if (str_starts_with($realPath . '/', $allowed . '/')) {
-                return true;
-            }
-        }
-
-        return false;
+    private static function number(mixed $v, string $name, float $min, float $max = INF): float {
+        if (!is_numeric($v)) throw new RuntimeException("Invalid --$name");
+        $n = (float)$v;
+        if (!is_finite($n) || $n < $min || $n > $max) throw new RuntimeException("Invalid --$name");
+        return $n;
+    }
+    private static function help(): string {
+        return 'Socket Statistics Tool '.VERSION."\nUsage: php main.php [OPTIONS]\n\n".
+            "  --json | --csv          Machine-readable output\n".
+            "  --extended              IPv6 and extended kernel counters\n".
+            "  --processes             Inspect /proc/PID/fd socket ownership\n".
+            "  --process-limit N       Maximum displayed processes (default 20)\n".
+            "  --watch                 Repeated sampling\n".
+            "  --interval SECONDS      Watch interval (default 2)\n".
+            "  --count N               Watch samples, 0 for unlimited\n".
+            "  --proc-root PATH        Alternative proc root\n".
+            "  --path PATH             Alternative net/sockstat file\n".
+            "  --output FILE           Write results to file\n".
+            "  --performance           Include runtime metrics\n".
+            "  --threshold-tcp N       TCP allocation warning\n".
+            "  --threshold-established N\n".
+            "  --threshold-timewait N\n".
+            "  --threshold-orphan N\n".
+            "  --threshold-retrans PCT Cumulative retransmission threshold\n".
+            "  --max-file-bytes N      Per-file read limit\n".
+            "  --config FILE           Optional flat INI configuration\n".
+            "  --quiet --verbose --help --version\n";
     }
 }
 
-final class ProtocolStats implements JsonSerializable
-{
-    private string $name;
-    private array $fields = [];
-
-    public function __construct(string $name, array $defaults = [])
-    {
-        $this->name = $name;
-        foreach ($defaults as $key => $value) {
-            $this->fields[$key] = (int) $value;
+final class ProcReader {
+    public array $warnings = [];
+    public function __construct(private Options $options) {}
+    public function lines(string $name, bool $required = false): array {
+        $path = $this->options->root.'/'.$name;
+        if (!is_file($path) || !is_readable($path)) {
+            if ($required) throw new RuntimeException("Required proc file unavailable: $path");
+            if ($this->options->verbose) $this->warnings[] = "Unavailable: $path";
+            return [];
         }
-    }
-
-    public function set(string $field, int $value): void
-    {
-        $this->fields[$field] = $value;
-    }
-
-    public function get(string $field, int $default = 0): int
-    {
-        return isset($this->fields[$field]) ? (int) $this->fields[$field] : $default;
-    }
-
-    public function hasPositiveInUse(): bool
-    {
-        return $this->get('in_use', 0) > 0;
-    }
-
-    public function isEmpty(): bool
-    {
-        foreach ($this->fields as $value) {
-            if ((int) $value !== 0) {
-                return false;
+        $handle = @fopen($path, 'rb');
+        if ($handle === false) {
+            if ($required) throw new RuntimeException("Cannot open $path");
+            $this->warnings[] = "Cannot open $path";
+            return [];
+        }
+        $lines = [];
+        $total = 0;
+        try {
+            while (($line = fgets($handle)) !== false) {
+                $total += strlen($line);
+                if ($total > $this->options->maxBytes) throw new RuntimeException("Read limit exceeded: $path");
+                $lines[] = rtrim($line, "\r\n");
             }
+            if (!feof($handle)) throw new RuntimeException("Read failure: $path");
+        } finally {
+            fclose($handle);
         }
-        return true;
-    }
-
-    public function getName(): string
-    {
-        return $this->name;
-    }
-
-    public function toArray(): array
-    {
-        return $this->fields;
-    }
-
-    public function jsonSerialize(): array
-    {
-        return $this->toArray();
+        return $lines;
     }
 }
 
-final class Metadata implements JsonSerializable
-{
-    public function __construct(
-        public readonly string $source,
-        public readonly string $generatedAt,
-        public readonly string $hostname
-    ) {
+final class Parsers {
+    public static function pairs(array $fields): array {
+        $result = [];
+        for ($i = 0; $i + 1 < count($fields); $i += 2) {
+            if (preg_match('/^-?\d+$/D', $fields[$i + 1])) $result[$fields[$i]] = (int)$fields[$i + 1];
+        }
+        return $result;
     }
+    public static function sockstat(array $lines): array {
+        $result = [];
+        foreach ($lines as $line) {
+            $parts = preg_split('/\s+/', trim($line));
+            if (count($parts) >= 3) $result[strtolower(rtrim(array_shift($parts), ':'))] = self::pairs($parts);
+        }
+        return $result;
+    }
+    public static function mib(array $lines): array {
+        $result = [];
+        $pending = [];
+        foreach ($lines as $line) {
+            $parts = preg_split('/\s+/', trim($line));
+            if (count($parts) < 2) continue;
+            $section = rtrim(array_shift($parts), ':');
+            if (!isset($pending[$section])) {
+                $pending[$section] = $parts;
+                continue;
+            }
+            $names = $pending[$section];
+            unset($pending[$section]);
+            if (count($names) !== count($parts)) continue;
+            foreach ($names as $i => $name) {
+                if (preg_match('/^-?\d+$/D', $parts[$i])) $result[$section][$name] = (int)$parts[$i];
+            }
+        }
+        return $result;
+    }
+    public static function inet(array $lines, string $protocol): array {
+        $states = [];
+        $inodes = [];
+        $count = 0;
+        foreach (array_slice($lines, 1) as $line) {
+            $parts = preg_split('/\s+/', trim($line));
+            if (count($parts) < 10) continue;
+            $count++;
+            if ($protocol === 'TCP') {
+                $state = TCP_STATES[strtoupper($parts[3])] ?? strtoupper($parts[3]);
+                $states[$state] = ($states[$state] ?? 0) + 1;
+            }
+            $inode = filter_var($parts[9], FILTER_VALIDATE_INT);
+            if ($inode !== false && $inode > 0) $inodes[$inode] = true;
+        }
+        ksort($states);
+        return ['count'=>$count,'states'=>$states,'inodes'=>$inodes];
+    }
+    public static function unix(array $lines): array {
+        $types = [];
+        $states = [];
+        $inodes = [];
+        $count = 0;
+        $named = 0;
+        $typeNames = ['0001'=>'STREAM','0002'=>'DGRAM','0005'=>'SEQPACKET'];
+        $stateNames = ['01'=>'UNCONNECTED','02'=>'CONNECTING','03'=>'CONNECTED','04'=>'DISCONNECTING'];
+        foreach (array_slice($lines, 1) as $line) {
+            $parts = preg_split('/\s+/', trim($line), 8);
+            if (count($parts) < 7) continue;
+            $count++;
+            $type = $typeNames[$parts[4]] ?? $parts[4];
+            $state = $stateNames[$parts[5]] ?? $parts[5];
+            $types[$type] = ($types[$type] ?? 0) + 1;
+            $states[$state] = ($states[$state] ?? 0) + 1;
+            if (isset($parts[7]) && $parts[7] !== '') $named++;
+            $inode = filter_var($parts[6], FILTER_VALIDATE_INT);
+            if ($inode !== false && $inode > 0) $inodes[$inode] = true;
+        }
+        ksort($types);
+        ksort($states);
+        return ['count'=>$count,'types'=>$types,'states'=>$states,'named_paths'=>$named,'inodes'=>$inodes];
+    }
+    public static function count(array $lines): int {
+        return count(array_filter(array_slice($lines, 1), static fn($line) => trim($line) !== ''));
+    }
+    public static function snmp6(array $lines): array {
+        $result = [];
+        foreach ($lines as $line) {
+            $parts = preg_split('/\s+/', trim($line));
+            if (count($parts) === 2 && preg_match('/^-?\d+$/D', $parts[1])) $result[$parts[0]] = (int)$parts[1];
+        }
+        return $result;
+    }
+}
 
-    public function toArray(): array
-    {
-        return [
-            'source' => $this->source,
-            'generated_at' => $this->generatedAt,
-            'hostname' => $this->hostname,
+final class Collector {
+    public function __construct(private Options $options) {}
+    public function collect(): array {
+        $start = hrtime(true);
+        $reader = new ProcReader($this->options);
+        $sock4 = Parsers::sockstat($reader->lines('net/sockstat', true));
+        $summary = [
+            'sockets_used'=>$sock4['sockets']['used'] ?? 0,
+            'tcp'=>$sock4['tcp'] ?? [], 'udp'=>$sock4['udp'] ?? [],
+            'udplite'=>$sock4['udplite'] ?? [], 'raw'=>$sock4['raw'] ?? [],
+            'frag'=>$sock4['frag'] ?? [],
         ];
-    }
-
-    public function jsonSerialize(): array
-    {
-        return $this->toArray();
-    }
-}
-
-final class PerformanceMetrics implements JsonSerializable
-{
-    public function __construct(
-        public readonly float $executionTimeSeconds,
-        public readonly float $peakMemoryMb,
-        public readonly string $phpVersion
-    ) {
-    }
-
-    public function toArray(): array
-    {
-        return [
-            'execution_time_seconds' => $this->executionTimeSeconds,
-            'peak_memory_mb' => $this->peakMemoryMb,
-            'php_version' => $this->phpVersion,
-        ];
-    }
-
-    public function jsonSerialize(): array
-    {
-        return $this->toArray();
-    }
-}
-
-final class SocketStatsReport implements JsonSerializable
-{
-    public Metadata $metadata;
-    public int $socketsUsed = 0;
-    private array $protocols = [];
-    private array $tcpExt = [];
-
-    public function __construct(Metadata $metadata)
-    {
-        $this->metadata = $metadata;
-    }
-
-    public function setSocketsUsed(int $value): void
-    {
-        $this->socketsUsed = $value;
-    }
-
-    public function addProtocol(string $key, ProtocolStats $stats): void
-    {
-        $this->protocols[$key] = $stats;
-    }
-
-    public function hasProtocol(string $key): bool
-    {
-        return isset($this->protocols[$key]);
-    }
-
-    public function getProtocol(string $key): ProtocolStats
-    {
-        if (!isset($this->protocols[$key])) {
-            throw new RuntimeException("Unknown protocol: {$key}");
+        if ($this->options->extended) $summary['ipv6'] = Parsers::sockstat($reader->lines('net/sockstat6'));
+        $tables = [];
+        $inodes = [];
+        $states = [];
+        foreach (TABLES as $name => [$protocol, $family]) {
+            if ($family === 6 && !$this->options->extended) continue;
+            $table = Parsers::inet($reader->lines('net/'.$name), $protocol);
+            $tables[$name] = ['count'=>$table['count'],'states'=>$table['states']];
+            $inodes += $table['inodes'];
+            foreach ($table['states'] as $state => $count) $states[$state] = ($states[$state] ?? 0) + $count;
         }
-        return $this->protocols[$key];
-    }
-
-    public function tryGetProtocol(string $key): ?ProtocolStats
-    {
-        return $this->protocols[$key] ?? null;
-    }
-
-    public function setTcpExt(array $values): void
-    {
-        $normalized = [];
-        foreach ($values as $key => $value) {
-            $normalized[(string) $key] = (int) $value;
+        ksort($states);
+        $unix = Parsers::unix($reader->lines('net/unix'));
+        $inodes += $unix['inodes'];
+        unset($unix['inodes']);
+        $summary['unix'] = $unix;
+        $summary['netlink'] = ['count'=>Parsers::count($reader->lines('net/netlink'))];
+        $summary['packet'] = ['count'=>Parsers::count($reader->lines('net/packet'))];
+        $summary['tcp_states'] = $states;
+        $summary['table_counts'] = array_map(static fn($t) => $t['count'], $tables);
+        $counters = array_replace_recursive(
+            Parsers::mib($reader->lines('net/snmp')),
+            Parsers::mib($reader->lines('net/netstat'))
+        );
+        if ($this->options->extended) {
+            $six = Parsers::snmp6($reader->lines('net/snmp6'));
+            if ($six) $counters['IPv6'] = $six;
         }
-        $this->tcpExt = $normalized;
-    }
-
-    public function getTcpExt(): array
-    {
-        return $this->tcpExt;
-    }
-
-    public function getProtocols(): array
-    {
-        return $this->protocols;
-    }
-
-    public function toArray(): array
-    {
         $data = [
-            'metadata' => $this->metadata->toArray(),
-            'sockets_used' => $this->socketsUsed,
+            'metadata'=>['version'=>VERSION,'hostname'=>gethostname() ?: 'unknown','timestamp'=>gmdate('Y-m-d\TH:i:s\Z'),'proc_root'=>$this->options->root,'pid'=>getmypid()],
+            'summary'=>$summary,'tables'=>$tables,'counters'=>$counters,'warnings'=>$reader->warnings,
         ];
-
-        foreach ($this->protocols as $key => $protocol) {
-            $data[$key] = $protocol->toArray();
-        }
-
-        if (!empty($this->tcpExt)) {
-            $data['tcp_ext'] = $this->tcpExt;
-        }
-
+        if ($this->options->processes) $data['ownership'] = $this->owners($inodes);
+        $this->thresholds($data);
+        if ($this->options->performance) $data['performance'] = [
+            'collection_seconds'=>round((hrtime(true) - $start) / 1e9, 6),
+            'peak_memory_mb'=>round(memory_get_peak_usage(true) / 1048576, 2),
+            'php_version'=>PHP_VERSION,
+        ];
         return $data;
     }
-
-    public function jsonSerialize(): array
-    {
-        return $this->toArray();
+    private function owners(array $inodes): array {
+        $counts = [];
+        $names = [];
+        $matched = [];
+        $scanned = 0;
+        $inaccessible = 0;
+        $dirs = @scandir($this->options->root);
+        if ($dirs === false) throw new RuntimeException('Cannot enumerate processes');
+        foreach ($dirs as $pid) {
+            if (!ctype_digit($pid)) continue;
+            $path = $this->options->root.'/'.$pid.'/fd';
+            $fds = @scandir($path);
+            if ($fds === false) {
+                $inaccessible++;
+                continue;
+            }
+            $scanned++;
+            $seen = [];
+            foreach ($fds as $fd) {
+                if ($fd === '.' || $fd === '..') continue;
+                $link = @readlink($path.'/'.$fd);
+                if ($link === false || !preg_match('/^socket:\[(\d+)\]$/D', $link, $m)) continue;
+                $inode = (int)$m[1];
+                if (!isset($inodes[$inode]) || isset($seen[$inode])) continue;
+                $seen[$inode] = true;
+                $matched[$inode] = true;
+                $counts[$pid] = ($counts[$pid] ?? 0) + 1;
+            }
+            if (isset($counts[$pid])) {
+                $name = @file_get_contents($this->options->root.'/'.$pid.'/comm');
+                $names[$pid] = $name === false ? 'unknown' : trim($name);
+            }
+        }
+        arsort($counts, SORT_NUMERIC);
+        $processes = [];
+        foreach (array_slice($counts, 0, $this->options->processLimit, true) as $pid => $count) {
+            $processes[] = ['pid'=>(int)$pid,'name'=>$names[$pid],'sockets'=>$count];
+        }
+        return ['scanned_processes'=>$scanned,'inaccessible_processes'=>$inaccessible,'matched_inodes'=>count($matched),'processes'=>$processes,'note'=>'Ownership is limited by permissions and visible namespaces.'];
+    }
+    private function thresholds(array &$data): void {
+        $s = $data['summary'];
+        $checks = [
+            'tcp'=>['TCP allocated',$s['tcp']['alloc'] ?? 0],
+            'established'=>['TCP established',$s['tcp_states']['ESTABLISHED'] ?? 0],
+            'timewait'=>['TCP time-wait',$s['tcp']['tw'] ?? 0],
+            'orphan'=>['TCP orphan',$s['tcp']['orphan'] ?? 0],
+        ];
+        foreach ($checks as $key => [$label,$value]) {
+            if (isset($this->options->thresholds[$key]) && $value >= $this->options->thresholds[$key]) {
+                $data['warnings'][] = "$label threshold reached: $value >= ".$this->options->thresholds[$key];
+            }
+        }
+        if (isset($this->options->thresholds['retrans'])) {
+            $tcp = $data['counters']['Tcp'] ?? [];
+            $out = $tcp['OutSegs'] ?? 0;
+            if ($out > 0) {
+                $ratio = 100 * ($tcp['RetransSegs'] ?? 0) / $out;
+                if ($ratio >= $this->options->thresholds['retrans']) $data['warnings'][] = sprintf('Cumulative TCP retransmission ratio %.2f%% >= %.2f%%', $ratio, $this->options->thresholds['retrans']);
+            }
+        }
     }
 }
 
-final class SocketStatsTool
-{
-    private const MAX_FILE_SIZE = 10485760;
-    private const MAX_LINE_SIZE = 1048576;
-    private const MAX_LOG_CACHE_SIZE = 1000;
-    private const LOG_CACHE_TTL = 300;
-    private const MAX_PROTOCOL_LINE_LENGTH = 1000;
-    private const MIN_VALID_LINE_PARTS = 2;
-    private const MAX_CONFIG_VALUE_LENGTH = 255;
-    private const MAX_MEMORY_CACHE_BYTES = 1048576;
-
-    private ToolConfig $config;
-    private array $logLevels;
-    private float $startTime;
-    private bool $shutdownRequested = false;
-    private array $logCache = [];
-    private array $logCacheTime = [];
-    private ?array $protocolParsers = null;
-
-    public function __construct()
-    {
-        $this->logLevels = [
-            'DEBUG' => 0,
-            'INFO' => 1,
-            'WARNING' => 2,
-            'ERROR' => 3,
-        ];
-
-        $this->config = new ToolConfig();
-        $this->startTime = microtime(true);
-    }
-
-    public function signalHandler(int $signo): void
-    {
-        $this->shutdownRequested = true;
-    }
-
-    public function run(): void
-    {
-        $this->bootstrapSignals();
-
-        try {
-            $this->parseCommandLine();
-
-            if ($this->config->help) {
-                $this->showHelp();
-                exit(0);
-            }
-
-            if ($this->config->configFile !== null) {
-                $this->config->loadFromFile($this->config->configFile);
-            }
-
-            $this->validateConfig();
-
-            $report = $this->getSocketStats();
-
-            if (!$this->config->quiet) {
-                $this->displayStats($report);
-            }
-
-            if ($this->config->showPerformance) {
-                $this->displayPerformanceMetrics($this->buildPerformanceMetrics());
-            }
-
-            exit(0);
-        } catch (Throwable $e) {
-            $this->logMessage('ERROR', $e->getMessage());
-            exit(1);
+final class Formatter {
+    public static function numeric(array $data, string $prefix = ''): array {
+        $out = [];
+        foreach ($data as $key => $value) {
+            $name = $prefix === '' ? (string)$key : $prefix.'.'.$key;
+            if (is_array($value)) $out += self::numeric($value, $name);
+            elseif (is_int($value) || is_float($value)) $out[$name] = $value;
         }
+        return $out;
     }
-
-    private function bootstrapSignals(): void
-    {
-        if (!extension_loaded('pcntl')) {
-            return;
+    public static function sampling(array $now, array $previous, float $elapsed): array {
+        $changes = [];
+        $rates = [];
+        foreach (['summary','counters'] as $section) {
+            $current = self::numeric($now[$section] ?? [], $section);
+            $old = self::numeric($previous[$section] ?? [], $section);
+            foreach ($current as $key => $value) {
+                if (!isset($old[$key])) continue;
+                $delta = $value - $old[$key];
+                if ($section === 'counters' && $delta < 0) continue;
+                if ($delta != 0) $changes[$key] = $delta;
+                if ($section === 'counters' && $elapsed > 0) $rates[$key] = round($delta / $elapsed, 3);
+            }
         }
-
-        if (function_exists('pcntl_async_signals')) {
-            pcntl_async_signals(true);
-        }
-
-        pcntl_signal(SIGINT, [$this, 'signalHandler']);
-        pcntl_signal(SIGTERM, [$this, 'signalHandler']);
-        pcntl_signal(SIGHUP, [$this, 'signalHandler']);
+        return ['elapsed_seconds'=>round($elapsed, 3),'changes'=>$changes,'counter_rates_per_second'=>$rates];
     }
-
-    private function parseCommandLine(): void
-    {
-        $options = getopt('', [
-            'json',
-            'log-level:',
-            'help',
-            'path:',
-            'performance',
-            'version',
-            'quiet',
-            'extended',
-            'config:',
+    private static function rows(array $rows): string {
+        $out = '';
+        foreach ($rows as $key => $value) $out .= sprintf("  %-32s %s\n", (string)$key, is_float($value) ? number_format($value, 3) : (string)$value);
+        return $out;
+    }
+    public static function human(array $data, Options $options): string {
+        $s = $data['summary'];
+        $m = $data['metadata'];
+        $out = "SOCKET STATISTICS\n".str_repeat('=', 72)."\n";
+        $out .= "Host:       {$m['hostname']}\nTimestamp:  {$m['timestamp']}\nSource:     {$m['proc_root']}\nVersion:    {$m['version']}\n";
+        $out .= "\nSOCKET SUMMARY\n".str_repeat('-', 72)."\n";
+        $out .= self::rows([
+            'Sockets used'=>$s['sockets_used'],'TCP allocated'=>$s['tcp']['alloc'] ?? 0,
+            'TCP in use'=>$s['tcp']['inuse'] ?? 0,'TCP orphan'=>$s['tcp']['orphan'] ?? 0,
+            'TCP time-wait'=>$s['tcp']['tw'] ?? 0,'UDP in use'=>$s['udp']['inuse'] ?? 0,
+            'RAW in use'=>$s['raw']['inuse'] ?? 0,'UNIX sockets'=>$s['unix']['count'],
+            'Netlink sockets'=>$s['netlink']['count'],'Packet sockets'=>$s['packet']['count'],
         ]);
-
-        if (isset($options['version'])) {
-            $this->showVersion();
-            exit(0);
-        }
-
-        if (isset($options['log-level'])) {
-            $level = (string) $options['log-level'];
-            if (strlen($level) > 50) {
-                throw new RuntimeException('Log level value too long');
-            }
-            $this->validateLogLevel($level);
-        }
-
-        if (isset($options['path'])) {
-            $path = (string) $options['path'];
-            if (strlen($path) > 4096) {
-                throw new RuntimeException('Path value too long');
+        $out .= "\nSOCKET MEMORY\n".str_repeat('-', 72)."\n";
+        $memory = [];
+        foreach (['tcp','udp','frag'] as $protocol) {
+            foreach (['mem','memory'] as $field) {
+                if (isset($s[$protocol][$field])) $memory[strtoupper($protocol)." $field (pages)"] = $s[$protocol][$field];
             }
         }
-
-        if (isset($options['config'])) {
-            $config = (string) $options['config'];
-            if (strlen($config) > 4096) {
-                throw new RuntimeException('Config path value too long');
-            }
-        }
-
-        $configUpdates = [];
-
-        if (isset($options['json'])) {
-            $configUpdates['jsonOutput'] = true;
-        }
-
-        if (isset($options['log-level'])) {
-            $configUpdates['logLevel'] = strtoupper((string) $options['log-level']);
-        }
-
-        if (isset($options['help'])) {
-            $configUpdates['help'] = true;
-        }
-
-        if (isset($options['path'])) {
-            $configUpdates['sockstatPath'] = $this->normalizePath((string) $options['path']);
-        }
-
-        if (isset($options['performance'])) {
-            $configUpdates['showPerformance'] = true;
-        }
-
-        if (isset($options['quiet'])) {
-            $configUpdates['quiet'] = true;
-        }
-
-        if (isset($options['extended'])) {
-            $configUpdates['extended'] = true;
-        }
-
-        if (isset($options['config'])) {
-            $configUpdates['configFile'] = $this->normalizePath((string) $options['config']);
-        }
-
-        $this->config = new ToolConfig($configUpdates);
-    }
-
-    private function validateLogLevel(string $level): void
-    {
-        $upper = strtoupper($level);
-        if (!isset($this->logLevels[$upper])) {
-            throw new RuntimeException(
-                "Invalid log level: {$level}. Valid levels: " . implode(', ', array_keys($this->logLevels))
-            );
-        }
-    }
-
-    private function normalizePath(string $path): string
-    {
-        $path = str_replace("\0", '', trim($path));
-        if ($path === '') {
-            return '';
-        }
-
-        $path = str_replace('\\', '/', $path);
-        $path = preg_replace('#/+#', '/', $path);
-        if (!is_string($path)) {
-            return '';
-        }
-
-        return $path;
-    }
-
-    private function validateConfig(): void
-    {
-        if (!isset($this->logLevels[$this->config->logLevel])) {
-            throw new RuntimeException(
-                "Invalid log level: {$this->config->logLevel}. Valid levels: " . implode(', ', array_keys($this->logLevels))
-            );
-        }
-
-        if ($this->config->sockstatPath === '') {
-            throw new RuntimeException("Invalid socket statistics path");
-        }
-
-        if (strpos($this->config->sockstatPath, "\0") !== false) {
-            throw new RuntimeException("Invalid path: contains null byte");
-        }
-
-        $realPath = realpath($this->config->sockstatPath);
-        if ($realPath === false) {
-            throw new RuntimeException("Invalid path: {$this->config->sockstatPath}");
-        }
-
-        if (!$this->isPathAllowed($realPath)) {
-            throw new RuntimeException("Path not allowed: {$this->config->sockstatPath}");
-        }
-    }
-
-    private function safeFileOpen(string $path): SplFileObject
-    {
-        $resolvedPath = realpath($path);
-        if ($resolvedPath === false) {
-            throw new RuntimeException("Cannot resolve path: {$path}");
-        }
-
-        if (!$this->isPathAllowed($resolvedPath)) {
-            throw new RuntimeException("Path not allowed: {$path}");
-        }
-
-        clearstatcache(true, $resolvedPath);
-
-        if (is_link($path)) {
-            $linkTarget = readlink($path);
-            if ($linkTarget !== false) {
-                $resolvedTarget = realpath($linkTarget) ?: $linkTarget;
-                if (!$this->isPathAllowed($resolvedTarget)) {
-                    throw new RuntimeException("Symbolic link target not allowed: {$path}");
+        $out .= $memory ? self::rows($memory) : "  No memory counters available\n";
+        $out .= "\nTCP CONNECTION STATES\n".str_repeat('-', 72)."\n";
+        arsort($s['tcp_states'], SORT_NUMERIC);
+        $out .= $s['tcp_states'] ? self::rows($s['tcp_states']) : "  No TCP entries found\n";
+        $out .= "\nPROTOCOL TABLES\n".str_repeat('-', 72)."\n".self::rows($s['table_counts']);
+        if ($options->extended) {
+            $out .= "\nIPV6 SOCKET STATISTICS\n".str_repeat('-', 72)."\n";
+            $out .= self::rows(self::numeric($s['ipv6'] ?? []));
+            $out .= "\nUNIX SOCKET TYPES\n".str_repeat('-', 72)."\n".self::rows($s['unix']['types']);
+            $out .= "\nKERNEL NETWORK COUNTERS\n".str_repeat('-', 72)."\n";
+            $selected = [];
+            foreach (IMPORTANT as $section => $fields) {
+                foreach ($fields as $field) {
+                    if (isset($data['counters'][$section][$field])) $selected[$section.'.'.$field] = $data['counters'][$section][$field];
                 }
             }
+            $out .= self::rows($selected);
         }
-
-        if (!is_file($resolvedPath) || !is_readable($resolvedPath)) {
-            throw new RuntimeException("Cannot access file {$path}");
+        if (isset($data['ownership'])) {
+            $p = $data['ownership'];
+            $out .= "\nSOCKET OWNERSHIP\n".str_repeat('-', 72)."\n";
+            $out .= self::rows(['Processes scanned'=>$p['scanned_processes'],'Processes inaccessible'=>$p['inaccessible_processes'],'Matched socket inodes'=>$p['matched_inodes']]);
+            $out .= sprintf("\n  %8s  %10s  %s\n", 'PID','SOCKETS','PROCESS');
+            foreach ($p['processes'] as $process) $out .= sprintf("  %8d  %10d  %s\n", $process['pid'],$process['sockets'],$process['name']);
         }
-
-        try {
-            $file = new SplFileObject($resolvedPath, 'r');
-            $file->setFlags(SplFileObject::READ_AHEAD | SplFileObject::SKIP_EMPTY);
-
-            $fileSize = $file->getSize();
-            if ($fileSize === false || $fileSize > self::MAX_FILE_SIZE) {
-                throw new RuntimeException("File size exceeds limit: {$path}");
-            }
-
-            return $file;
-        } catch (RuntimeException $e) {
-            throw new RuntimeException("Cannot access file {$path}: " . $e->getMessage());
+        if (isset($data['sampling'])) {
+            $p = $data['sampling'];
+            $out .= "\nCHANGES SINCE PREVIOUS SAMPLE\n".str_repeat('-', 72)."\n";
+            $out .= '  Interval: '.$p['elapsed_seconds']." seconds\n";
+            $out .= self::rows($p['changes']);
+            $out .= "\nCOUNTER RATES PER SECOND\n".str_repeat('-', 72)."\n";
+            $out .= self::rows(array_filter($p['counter_rates_per_second'], static fn($n) => $n != 0));
         }
+        if (isset($data['performance'])) $out .= "\nPERFORMANCE\n".str_repeat('-', 72)."\n".self::rows($data['performance']);
+        if ($data['warnings']) $out .= "\nWARNINGS\n".str_repeat('-', 72)."\n  ".implode("\n  ", $data['warnings'])."\n";
+        return rtrim($out)."\n";
     }
-
-    private function isPathAllowed(string $realPath): bool
-    {
-        $allowedDirs = [
-            realpath('/proc/net') ?: '/proc/net',
-            realpath('/proc') ?: '/proc',
-            realpath('/tmp/socket-stats') ?: '/tmp/socket-stats',
-        ];
-
-        foreach ($allowedDirs as $allowedDir) {
-            if (str_starts_with($realPath . '/', $allowedDir . '/')) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private function logMessage(string $level, string $message): void
-    {
-        if ($this->shutdownRequested) {
-            return;
-        }
-
-        if ($level === 'DEBUG') {
-            $cacheKey = crc32($message) . '_' . substr(md5($message), 0, 8);
-            $now = time();
-
-            if (count($this->logCache) > self::MAX_LOG_CACHE_SIZE) {
-                $this->cleanLogCache();
-            }
-
-            if (isset($this->logCache[$cacheKey], $this->logCacheTime[$cacheKey])) {
-                if (($now - $this->logCacheTime[$cacheKey]) < self::LOG_CACHE_TTL) {
-                    return;
-                }
-            }
-
-            $this->logCache[$cacheKey] = $message;
-            $this->logCacheTime[$cacheKey] = $now;
-        }
-
-        $msgLevel = $this->logLevels[$level] ?? $this->logLevels['INFO'];
-        $confLevel = $this->logLevels[$this->config->logLevel];
-
-        if ($msgLevel < $confLevel) {
-            return;
-        }
-
-        $timestamp = date('Y-m-d H:i:s');
-        file_put_contents('php://stderr', "[{$timestamp}] {$level}: {$message}" . PHP_EOL);
-    }
-
-    private function cleanLogCache(): void
-    {
-        $now = time();
-
-        foreach ($this->logCacheTime as $key => $timestamp) {
-            if (($now - $timestamp) > self::LOG_CACHE_TTL) {
-                unset($this->logCache[$key], $this->logCacheTime[$key]);
-            }
-        }
-
-        if (count($this->logCache) <= self::MAX_LOG_CACHE_SIZE) {
-            return;
-        }
-
-        $currentMemory = 0;
-        foreach ($this->logCache as $message) {
-            $currentMemory += strlen($message);
-        }
-
-        if ($currentMemory > self::MAX_MEMORY_CACHE_BYTES) {
-            arsort($this->logCacheTime);
-            while ($currentMemory > self::MAX_MEMORY_CACHE_BYTES && !empty($this->logCache)) {
-                $oldestKey = key($this->logCacheTime);
-                $currentMemory -= strlen($this->logCache[$oldestKey]);
-                unset($this->logCache[$oldestKey], $this->logCacheTime[$oldestKey]);
-                next($this->logCacheTime);
-            }
-            return;
-        }
-
-        asort($this->logCacheTime);
-        $excess = count($this->logCache) - self::MAX_LOG_CACHE_SIZE;
-        $keys = array_keys($this->logCacheTime);
-
-        for ($i = 0; $i < $excess; $i++) {
-            $key = $keys[$i];
-            unset($this->logCache[$key], $this->logCacheTime[$key]);
-        }
-    }
-
-    private function showVersion(): void
-    {
-        echo "Socket Statistics Tool 1.3.0" . PHP_EOL;
-        echo "PHP " . PHP_VERSION . PHP_EOL;
-    }
-
-    private function showHelp(): void
-    {
-        $scriptName = basename($_SERVER['argv'][0] ?? 'tool.php');
-
-        $helpText =
-            "Socket Statistics Tool 1.3.0\n\n" .
-            "Usage: {$scriptName} [OPTIONS]\n\n" .
-            "Options:\n" .
-            "  --json                 Output socket summary in JSON format\n" .
-            "  --log-level LEVEL      Set log level (DEBUG, INFO, WARNING, ERROR)\n" .
-            "  --path PATH            Path to sockstat file (default: /proc/net/sockstat)\n" .
-            "  --performance          Show performance metrics\n" .
-            "  --quiet                Suppress all non-error output\n" .
-            "  --extended             Show extended protocol information\n" .
-            "  --config FILE          Load configuration from file\n" .
-            "  --version              Display version information\n" .
-            "  --help                 Display this help message\n\n" .
-            "Examples:\n" .
-            "  {$scriptName} --json\n" .
-            "  {$scriptName} --log-level DEBUG\n" .
-            "  {$scriptName} --json --log-level WARNING\n" .
-            "  {$scriptName} --path /tmp/test-sockstat --json\n" .
-            "  {$scriptName} --performance --json\n" .
-            "  {$scriptName} --quiet --json\n" .
-            "  {$scriptName} --extended --json\n" .
-            "  {$scriptName} --config /etc/socket-stats/config.ini\n\n";
-
-        echo $helpText;
-    }
-
-    private function getSocketStats(): SocketStatsReport
-    {
-        $this->logMessage('INFO', "Reading socket statistics from {$this->config->sockstatPath}");
-
-        $file = $this->safeFileOpen($this->config->sockstatPath);
-
-        $report = new SocketStatsReport(
-            new Metadata(
-                source: $this->config->sockstatPath,
-                generatedAt: date('c'),
-                hostname: gethostname() ?: 'unknown'
-            )
-        );
-
-        $report->addProtocol('tcp', new ProtocolStats('TCP', [
-            'in_use' => 0,
-            'orphan' => 0,
-            'time_wait' => 0,
-            'allocated' => 0,
-            'memory' => 0,
-        ]));
-        $report->addProtocol('udp', new ProtocolStats('UDP', [
-            'in_use' => 0,
-            'memory' => 0,
-        ]));
-        $report->addProtocol('udp_lite', new ProtocolStats('UDPLite', [
-            'in_use' => 0,
-        ]));
-        $report->addProtocol('raw', new ProtocolStats('RAW', [
-            'in_use' => 0,
-        ]));
-        $report->addProtocol('frag', new ProtocolStats('FRAG', [
-            'in_use' => 0,
-            'memory' => 0,
-        ]));
-
-        if ($this->config->extended) {
-            $this->initializeExtendedStats($report);
-        }
-
-        $this->readSockstatFile($file, $report);
-
-        if ($this->config->extended) {
-            $this->loadExtendedProtocolInfo($report);
-        }
-
-        return $report;
-    }
-
-    private function readSockstatFile(SplFileObject $file, SocketStatsReport $report): void
-    {
-        $lineCount = 0;
-
-        foreach ($file as $line) {
-            if ($this->shutdownRequested) {
-                break;
-            }
-
-            $line = trim((string) $line);
-            if ($line === '') {
-                continue;
-            }
-
-            if (strlen($line) > self::MAX_LINE_SIZE) {
-                $this->logMessage('WARNING', "Line too long, skipping");
-                continue;
-            }
-
-            $this->parseLine($line, $report);
-            $lineCount++;
-
-            if ($lineCount > self::MAX_PROTOCOL_LINE_LENGTH) {
-                throw new RuntimeException("File appears too large or malformed");
-            }
-        }
-
-        $this->logMessage('DEBUG', "Processed {$lineCount} lines from sockstat file");
-    }
-
-    private function getProtocolParsers(): array
-    {
-        if ($this->protocolParsers !== null) {
-            return $this->protocolParsers;
-        }
-
-        $this->protocolParsers = [
-            'sockets:' => function (array $parts, SocketStatsReport $report): void {
-                if (count($parts) >= 3) {
-                    $report->setSocketsUsed($this->parseInt($parts[2]));
-                }
-            },
-            'TCP:' => function (array $parts, SocketStatsReport $report): void {
-                $this->parseProtocolSection($parts, $report, 'tcp', [
-                    'inuse' => 'in_use',
-                    'orphan' => 'orphan',
-                    'tw' => 'time_wait',
-                    'alloc' => 'allocated',
-                    'mem' => 'memory',
-                ]);
-            },
-            'UDP:' => function (array $parts, SocketStatsReport $report): void {
-                $this->parseProtocolSection($parts, $report, 'udp', [
-                    'inuse' => 'in_use',
-                    'mem' => 'memory',
-                ]);
-            },
-            'UDPLITE:' => function (array $parts, SocketStatsReport $report): void {
-                $this->parseProtocolSection($parts, $report, 'udp_lite', [
-                    'inuse' => 'in_use',
-                ]);
-            },
-            'RAW:' => function (array $parts, SocketStatsReport $report): void {
-                $this->parseProtocolSection($parts, $report, 'raw', [
-                    'inuse' => 'in_use',
-                ]);
-            },
-            'FRAG:' => function (array $parts, SocketStatsReport $report): void {
-                $this->parseProtocolSection($parts, $report, 'frag', [
-                    'inuse' => 'in_use',
-                    'memory' => 'memory',
-                ]);
-            },
-            'TCP6:' => function (array $parts, SocketStatsReport $report): void {
-                if ($this->config->extended && $report->hasProtocol('tcp6')) {
-                    $this->parseProtocolSection($parts, $report, 'tcp6', [
-                        'inuse' => 'in_use',
-                        'orphan' => 'orphan',
-                        'tw' => 'time_wait',
-                        'alloc' => 'allocated',
-                        'mem' => 'memory',
-                    ]);
-                }
-            },
-            'UDP6:' => function (array $parts, SocketStatsReport $report): void {
-                if ($this->config->extended && $report->hasProtocol('udp6')) {
-                    $this->parseProtocolSection($parts, $report, 'udp6', [
-                        'inuse' => 'in_use',
-                        'mem' => 'memory',
-                    ]);
-                }
-            },
-        ];
-
-        return $this->protocolParsers;
-    }
-
-    private function parseLine(string $line, SocketStatsReport $report): void
-    {
-        $parts = preg_split('/\s+/', trim($line));
-        if ($parts === false || count($parts) < self::MIN_VALID_LINE_PARTS) {
-            $this->logMessage('DEBUG', "Skipping malformed line: {$line}");
-            return;
-        }
-
-        $parsers = $this->getProtocolParsers();
-        $section = $parts[0];
-
-        if (isset($parsers[$section])) {
-            $parsers[$section]($parts, $report);
-            return;
-        }
-
-        $this->logMessage('DEBUG', "Unknown section: {$section}");
-    }
-
-    private function initializeExtendedStats(SocketStatsReport $report): void
-    {
-        $report->addProtocol('tcp6', new ProtocolStats('TCP6', [
-            'in_use' => 0,
-            'orphan' => 0,
-            'time_wait' => 0,
-            'allocated' => 0,
-            'memory' => 0,
-        ]));
-        $report->addProtocol('udp6', new ProtocolStats('UDP6', [
-            'in_use' => 0,
-            'memory' => 0,
-        ]));
-        $report->addProtocol('unix', new ProtocolStats('UNIX', [
-            'in_use' => 0,
-            'dynamic' => 0,
-            'inode' => 0,
-        ]));
-        $report->addProtocol('icmp', new ProtocolStats('ICMP', [
-            'in_use' => 0,
-        ]));
-        $report->addProtocol('icmp6', new ProtocolStats('ICMP6', [
-            'in_use' => 0,
-        ]));
-        $report->addProtocol('netlink', new ProtocolStats('Netlink', [
-            'in_use' => 0,
-        ]));
-        $report->addProtocol('packet', new ProtocolStats('Packet', [
-            'in_use' => 0,
-            'memory' => 0,
-        ]));
-    }
-
-    private function loadExtendedProtocolInfo(SocketStatsReport $report): void
-    {
-        $filesToLoad = [
-            'unix' => ['path' => '/proc/net/sockstat6', 'section' => 'UNIX:', 'type' => 'section'],
-            'netlink' => ['path' => '/proc/net/netlink', 'type' => 'count'],
-            'packet' => ['path' => '/proc/net/packet', 'type' => 'count'],
-            'icmp' => ['path' => '/proc/net/snmp', 'type' => 'snmp'],
-            'icmp6' => ['path' => '/proc/net/snmp', 'type' => 'snmp6'],
-        ];
-
-        foreach ($filesToLoad as $protocol => $info) {
-            try {
-                $file = $this->safeFileOpen($info['path']);
-
-                if ($info['type'] === 'count') {
-                    $count = $this->countFileLines($file);
-                    $stats = $report->tryGetProtocol($protocol);
-                    if ($stats !== null) {
-                        $stats->set('in_use', $count);
-                    }
-                } elseif ($info['type'] === 'section') {
-                    $this->loadProtocolFile($file, (string) $info['section'], $report, $protocol, [
-                        'inuse' => 'in_use',
-                        'dynamic' => 'dynamic',
-                        'inode' => 'inode',
-                    ]);
-                } elseif ($info['type'] === 'snmp') {
-                    $count = $this->loadSnmpInfo($file, 'Icmp:');
-                    $stats = $report->tryGetProtocol('icmp');
-                    if ($stats !== null) {
-                        $stats->set('in_use', $count);
-                    }
-                } elseif ($info['type'] === 'snmp6') {
-                    $count = $this->loadSnmpInfo($file, 'Icmp6:');
-                    $stats = $report->tryGetProtocol('icmp6');
-                    if ($stats !== null) {
-                        $stats->set('in_use', $count);
-                    }
-                }
-            } catch (RuntimeException $e) {
-                $this->logMessage('DEBUG', "Could not load {$protocol} info: " . $e->getMessage());
-            }
-        }
-
-        $this->loadAdditionalNetworkStats($report);
-    }
-
-    private function countFileLines(SplFileObject $file): int
-    {
-        $file->seek(PHP_INT_MAX);
-        $lineCount = $file->key();
-        $file->rewind();
-        return max(0, $lineCount - 1);
-    }
-
-    private function loadProtocolFile(SplFileObject $file, string $section, SocketStatsReport $report, string $protocol, array $mapping): void
-    {
-        foreach ($file as $line) {
-            if ($this->shutdownRequested) {
-                break;
-            }
-
-            $line = trim((string) $line);
-            if (!str_starts_with($line, $section)) {
-                continue;
-            }
-
-            $parts = preg_split('/\s+/', $line);
-            if ($parts !== false) {
-                $this->parseProtocolSection($parts, $report, $protocol, $mapping);
-            }
-            break;
-        }
-    }
-
-    private function loadSnmpInfo(SplFileObject $file, string $targetLine): int
-    {
-        $inTargetLine = false;
-
-        foreach ($file as $line) {
-            if ($this->shutdownRequested) {
-                break;
-            }
-
-            $line = trim((string) $line);
-
-            if (str_starts_with($line, $targetLine)) {
-                $inTargetLine = true;
-                continue;
-            }
-
-            if ($inTargetLine) {
-                $parts = preg_split('/\s+/', $line);
-                if ($parts !== false && count($parts) > 0) {
-                    return $this->parseInt($parts[0]);
-                }
-                break;
-            }
-        }
-
-        return 0;
-    }
-
-    private function parseTcpExtendedStats(string $line, SocketStatsReport $report): void
-    {
-        if (!$this->config->extended) {
-            return;
-        }
-
-        $parts = preg_split('/\s+/', trim($line));
-        if ($parts === false || count($parts) < 2) {
-            return;
-        }
-
-        $values = [];
-        for ($i = 1; $i < count($parts); $i += 2) {
-            if (!isset($parts[$i + 1])) {
-                break;
-            }
-
-            $values[$parts[$i]] = $this->parseInt($parts[$i + 1]);
-        }
-
-        $report->setTcpExt($values);
-    }
-
-    private function parseProtocolSection(array $parts, SocketStatsReport $report, string $protocol, array $mapping): void
-    {
-        $stats = $report->tryGetProtocol($protocol);
-        if ($stats === null) {
-            $stats = new ProtocolStats($protocol);
-            $report->addProtocol($protocol, $stats);
-        }
-
-        for ($i = 1; $i < count($parts); $i += 2) {
-            if (!isset($parts[$i + 1])) {
-                break;
-            }
-
-            $key = $parts[$i];
-            $value = $parts[$i + 1];
-
-            if (isset($mapping[$key])) {
-                $stats->set($mapping[$key], $this->parseInt($value));
-            } else {
-                $this->logMessage('DEBUG', "Unknown {$protocol} field: {$key}");
-            }
-        }
-    }
-
-    private function parseInt(string $value): int
-    {
-        $parsed = filter_var($value, FILTER_VALIDATE_INT);
-        if ($parsed === false) {
-            $this->logMessage('WARNING', "Failed to parse integer '{$value}', using 0");
-            return 0;
-        }
-        return $parsed;
-    }
-
-    private function displayStats(SocketStatsReport $report): void
-    {
-        if ($this->config->jsonOutput) {
-            $this->outputJSON($report);
-            return;
-        }
-
-        $this->outputHumanReadable($report);
-    }
-
-    private function outputJSON(SocketStatsReport $report): void
-    {
-        $jsonData = json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-        if ($jsonData === false) {
-            throw new RuntimeException('Failed to encode JSON: ' . json_last_error_msg());
-        }
-
-        echo $jsonData . PHP_EOL;
-    }
-
-    private function outputHumanReadable(SocketStatsReport $report): void
-    {
-        $useColor = $this->detectTerminalCapabilities() === 'color';
-        $this->outputFormatted($report, $useColor);
-    }
-
-    private function detectTerminalCapabilities(): string
-    {
-        if (!function_exists('posix_isatty') || !posix_isatty(STDOUT)) {
-            return 'plain';
-        }
-
-        $term = getenv('TERM');
-        if (is_string($term) && ($term !== '')) {
-            if (str_contains($term, 'xterm') || str_contains($term, 'color')) {
-                return 'color';
-            }
-        }
-
-        return 'plain';
-    }
-
-    private function outputFormatted(SocketStatsReport $report, bool $useColor): void
-    {
-        $colorStart = $useColor ? "\033[1;36m" : '';
-        $colorEnd = $useColor ? "\033[0m" : '';
-        $titleColor = $useColor ? "\033[1;33m" : '';
-        $sectionColor = $useColor ? "\033[1;35m" : '';
-        $fieldColor = $useColor ? "\033[1;34m" : '';
-
-        echo "{$colorStart}Socket Statistics{$colorEnd}" . PHP_EOL;
-        echo "{$colorStart}================={$colorEnd}" . PHP_EOL;
-        echo "{$titleColor}Generated:{$colorEnd} {$report->metadata->generatedAt}" . PHP_EOL;
-        echo "{$titleColor}Hostname:{$colorEnd}  {$report->metadata->hostname}" . PHP_EOL;
-        echo "{$titleColor}Source:{$colorEnd}    {$report->metadata->source}" . PHP_EOL;
-        echo PHP_EOL;
-
-        echo "{$titleColor}Sockets used:{$colorEnd} {$report->socketsUsed}" . PHP_EOL . PHP_EOL;
-
-        $baseProtocols = ['tcp', 'udp', 'udp_lite', 'raw', 'frag'];
-        foreach ($baseProtocols as $key) {
-            $protocol = $report->tryGetProtocol($key);
-            if ($protocol !== null) {
-                $this->outputProtocol($protocol->getName(), $protocol, $sectionColor, $fieldColor, $colorEnd);
-            }
-        }
-
-        if ($this->config->extended) {
-            $this->outputExtended($report, $titleColor, $sectionColor, $fieldColor, $colorEnd);
-        }
-    }
-
-    private function outputProtocol(string $name, ProtocolStats $protocol, string $sectionColor, string $fieldColor, string $colorEnd): void
-    {
-        if ($protocol->isEmpty()) {
-            return;
-        }
-
-        echo "{$sectionColor}{$name}:{$colorEnd}" . PHP_EOL;
-
-        foreach ($protocol->toArray() as $field => $value) {
-            $fieldName = ucwords(str_replace('_', ' ', $field));
-            $padding = str_repeat(' ', max(1, 12 - strlen($fieldName)));
-            echo "  {$fieldColor}{$fieldName}:{$colorEnd}{$padding}{$value}" . PHP_EOL;
-        }
-
-        echo PHP_EOL;
-    }
-
-    private function outputExtended(SocketStatsReport $report, string $titleColor, string $sectionColor, string $fieldColor, string $colorEnd): void
-    {
-        echo PHP_EOL . "{$titleColor}Extended Protocol Information:{$colorEnd}" . PHP_EOL;
-        echo "{$titleColor}============================={$colorEnd}" . PHP_EOL;
-
-        $extendedProtocols = ['tcp6', 'udp6', 'unix', 'netlink', 'packet', 'icmp', 'icmp6'];
-
-        foreach ($extendedProtocols as $key) {
-            $protocol = $report->tryGetProtocol($key);
-            if ($protocol === null) {
-                continue;
-            }
-
-            if ($protocol->hasPositiveInUse()) {
-                $this->outputProtocol($protocol->getName(), $protocol, $sectionColor, $fieldColor, $colorEnd);
-            }
-        }
-
-        $tcpExt = $report->getTcpExt();
-        if (!empty($tcpExt)) {
-            echo "{$sectionColor}TcpExt:{$colorEnd}" . PHP_EOL;
-            foreach ($tcpExt as $field => $value) {
-                echo "  {$fieldColor}{$field}:{$colorEnd} {$value}" . PHP_EOL;
-            }
-            echo PHP_EOL;
-        }
-    }
-
-    private function loadAdditionalNetworkStats(SocketStatsReport $report): void
-    {
-        try {
-            $file = $this->safeFileOpen('/proc/net/netstat');
-
-            foreach ($file as $line) {
-                if ($this->shutdownRequested) {
-                    break;
-                }
-
-                $line = trim((string) $line);
-
-                if (str_starts_with($line, 'TcpExt:')) {
-                    $this->parseTcpExtendedStats($line, $report);
-                }
-            }
-        } catch (RuntimeException $e) {
-            $this->logMessage('DEBUG', "Could not read extended network stats: " . $e->getMessage());
-        }
-    }
-
-    private function buildPerformanceMetrics(): PerformanceMetrics
-    {
-        $executionTime = round(microtime(true) - $this->startTime, 4);
-        $memoryUsage = round(memory_get_peak_usage(true) / 1024 / 1024, 2);
-
-        return new PerformanceMetrics(
-            executionTimeSeconds: $executionTime,
-            peakMemoryMb: $memoryUsage,
-            phpVersion: PHP_VERSION
-        );
-    }
-
-    private function displayPerformanceMetrics(PerformanceMetrics $metrics): void
-    {
-        if ($this->config->jsonOutput) {
-            $jsonData = json_encode(['performance' => $metrics], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-            if ($jsonData === false) {
-                throw new RuntimeException('Failed to encode JSON: ' . json_last_error_msg());
-            }
-            echo $jsonData . PHP_EOL;
-            return;
-        }
-
-        $useColor = $this->detectTerminalCapabilities() === 'color';
-        $colorStart = $useColor ? "\033[1;36m" : '';
-        $colorEnd = $useColor ? "\033[0m" : '';
-        $titleColor = $useColor ? "\033[1;33m" : '';
-
-        echo PHP_EOL . "{$colorStart}Performance Metrics:{$colorEnd}" . PHP_EOL;
-        echo "{$colorStart}==================={$colorEnd}" . PHP_EOL;
-        echo "{$titleColor}Execution time:{$colorEnd} {$metrics->executionTimeSeconds}s" . PHP_EOL;
-        echo "{$titleColor}Peak memory:{$colorEnd}    {$metrics->peakMemoryMb} MB" . PHP_EOL;
-        echo "{$titleColor}PHP version:{$colorEnd}    {$metrics->phpVersion}" . PHP_EOL;
+    public static function csvRow(array $data): array {
+        $row = ['timestamp'=>$data['metadata']['timestamp'],'hostname'=>$data['metadata']['hostname']];
+        foreach (['summary','counters','performance','sampling'] as $section) $row += self::numeric($data[$section] ?? [], $section);
+        return $row;
     }
 }
 
-if (PHP_SAPI === 'cli') {
-    $app = new SocketStatsTool();
-    $app->run();
-} else {
-    echo "This script must be run from the command line." . PHP_EOL;
+final class Output {
+    private $stream;
+    private bool $owned;
+    private bool $first = true;
+    private array $csvColumns = [];
+    public function __construct(private Options $options) {
+        $this->owned = $options->output !== null;
+        $this->stream = $this->owned ? @fopen($options->output, 'wb') : STDOUT;
+        if ($this->stream === false) throw new RuntimeException('Cannot open output file');
+    }
+    public function emit(array $data): void {
+        if ($this->options->quiet) return;
+        if ($this->options->format === 'csv') {
+            $row = Formatter::csvRow($data);
+            if ($this->first) {
+                $this->csvColumns = array_keys($row);
+                if ($this->options->watch) {
+                    foreach (array_keys(Formatter::numeric($data['counters'] ?? [], 'counters')) as $key) $this->csvColumns[] = 'sampling.counter_rates_per_second.'.$key;
+                    $this->csvColumns[] = 'sampling.elapsed_seconds';
+                }
+                fputcsv($this->stream, $this->csvColumns, ',', '"', '');
+            }
+            $values = [];
+            foreach ($this->csvColumns as $key) $values[] = $row[$key] ?? '';
+            fputcsv($this->stream, $values, ',', '"', '');
+        } elseif ($this->options->format === 'json') {
+            $flags = JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR;
+            if (!$this->options->watch) $flags |= JSON_PRETTY_PRINT;
+            fwrite($this->stream, json_encode($data, $flags)."\n");
+        } else {
+            if (!$this->first) fwrite($this->stream, "\n");
+            fwrite($this->stream, Formatter::human($data, $this->options));
+        }
+        fflush($this->stream);
+        $this->first = false;
+    }
+    public function close(): void {
+        if ($this->owned && is_resource($this->stream)) fclose($this->stream);
+    }
+}
+
+function main(array $argv): int {
+    $options = Options::parse($argv);
+    $collector = new Collector($options);
+    $output = new Output($options);
+    $running = true;
+    if (function_exists('pcntl_async_signals')) {
+        pcntl_async_signals(true);
+        foreach ([SIGINT, SIGTERM] as $sig) pcntl_signal($sig, static function () use (&$running): void { $running = false; });
+    }
+    $previous = null;
+    $previousTime = null;
+    $completed = 0;
+    try {
+        while ($running) {
+            $started = hrtime(true) / 1e9;
+            $data = $collector->collect();
+            if ($previous !== null && $previousTime !== null) $data['sampling'] = Formatter::sampling($data, $previous, $started - $previousTime);
+            $output->emit($data);
+            $previous = $data;
+            $previousTime = $started;
+            $completed++;
+            if (!$options->watch || ($options->count > 0 && $completed >= $options->count)) break;
+            $deadline = $started + $options->interval;
+            while ($running && ($remaining = $deadline - hrtime(true) / 1e9) > 0) usleep((int)(min($remaining, 0.2) * 1e6));
+        }
+    } finally {
+        $output->close();
+    }
+    return 0;
+}
+
+if (PHP_SAPI !== 'cli') {
+    http_response_code(403);
+    exit(1);
+}
+try {
+    exit(main($argv));
+} catch (Throwable $e) {
+    fwrite(STDERR, 'Error: '.$e->getMessage().PHP_EOL);
     exit(1);
 }
